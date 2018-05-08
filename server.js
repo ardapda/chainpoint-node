@@ -18,8 +18,6 @@ const validator = require('validator')
 const env = require('./lib/parse-env.js')
 
 const fs = require('fs')
-const os = require('os')
-const { exec } = require('child_process')
 const apiServer = require('./lib/api-server.js')
 const calendarBlock = require('./lib/models/CalendarBlock.js')
 const publicKey = require('./lib/models/PublicKey.js')
@@ -33,7 +31,6 @@ const moment = require('moment')
 const ip = require('ip')
 const bluebird = require('bluebird')
 const url = require('url')
-const rp = require('request-promise-native')
 const { version } = require('./package.json')
 
 const r = require('redis')
@@ -104,8 +101,6 @@ async function validateUriAsync (nodeUri) {
 
   if (isValidURI && uriHasValidIPHost && !ip.isPrivate(parsedURIHost)) {
     return nodeUri
-  } else if (isValidURI && uriHasValidIPHost && ip.isPrivate(parsedURIHost)) {
-    throw new Error(`RFC1918 Private IP Addresses like "${parsedURIHost}" cannot be specified as CHAINPOINT_NODE_PUBLIC_URI`)
   } else {
     return null
   }
@@ -140,18 +135,17 @@ async function authKeysUpdate () {
     // 2) /keys/backups/0xabc-<timestamp>.key which is a backup .key file and contains a timestamp to prevent filename collisions
     let fileName = currVal.split(/\.|-/)[0]
 
-    return (/^.*\.(key)$/).test(currVal) && _.toLower(fileName) === env.NODE_TNT_ADDRESS
+    return (/^.*\.(key)$/).test(currVal) && fileName === env.NODE_TNT_ADDRESS
   })
 
   if (keys.length) {
     // Iterate through all key files found and write hmac key to PostgreSQL
-    for (let key of keys) {
+    keys.forEach(async (key) => {
       let isHMAC = (k) => {
         return /^[0-9a-fA-F]{64}$/i.test(k)
       }
       let keyFile = key
       let keyFileContent = fs.readFileSync(`./keys/${keyFile}`, 'utf8')
-      keyFileContent = _.head(keyFileContent.split(os.EOL).map(_.trim).filter(isHMAC))
 
       if (isHMAC(keyFileContent)) {
         // If an entry exists within hmackeys table with a primary key of the NODE_TNT_ADDRESS, simply update the record with
@@ -171,13 +165,13 @@ async function authKeysUpdate () {
           console.log(`INFO : Registration : Auth key saved to PostgreSQL : ${keyFile}`)
         } catch (err) {
           console.error(`ERROR : Registration : Error inserting/updating auth key in PostgreSQL : ${keyFile}`)
-          process.exit(0)
+          process.exit(1)
         }
       } else {
         console.error(`ERROR : Registration : Invalid HMAC Auth Key : ${keyFile}`)
-        process.exit(0)
+        process.exit(1)
       }
-    }
+    })
   }
 }
 
@@ -322,16 +316,6 @@ async function registerNodeAsync (nodeURI) {
           console.log(`INFO : Registration : New Registration OK!`)
           console.log(`INFO : ***********************************`)
 
-          // New Registration Succeeded. Perform Automatic Auth Key Backup for newly saved hmac key
-          try {
-            exec('node auth-keys-backup-script.js', (err, stdout, stderr) => {
-              if (err) console.error(`ERROR : Registration : BackupAuthKeys : Unable to complete key backup(s)`)
-              else console.log(stdout)
-            })
-          } catch (error) {
-            console.log(`ERROR : Registration : AuthKeyBackup : ${error}`)
-          }
-
           return response.hmac_key
         } catch (error) {
           if (error.statusCode === 409) {
@@ -381,7 +365,7 @@ async function registerNodeAsync (nodeURI) {
         //console.error(`ERROR : Registration : Failed : Max Retries Reached!`)
         //console.error(`ERROR : ********************************************`)
         //process.exit(0)
-//}
+      //}
 
       await utils.sleepAsync(retryWaitTimeMs)
     }
@@ -420,26 +404,6 @@ function startIntervals (coreConfig) {
   calendar.startCalculateChallengeSolutionAsync(SOLVE_CHALLENGE_INTERVAL_MS)
 }
 
-async function nodeHeartbeat (nodeUri) {
-  try {
-    let response = await rp({
-      method: 'GET',
-      uri: `${nodeUri}/config`,
-      json: true,
-      gzip: true,
-      resolveWithFullResponse: true,
-      timeout: 5000
-    })
-
-    if (response.statusCode === 200) {
-      console.log(`INFO : App : Node URI Health Check OK for URI : ${nodeUri}`)
-      return Promise.resolve()
-    } else { throw new Error() }
-  } catch (error) {
-    return Promise.reject(new Error(`Node URI Health Check Failed for URI : ${nodeUri}`))
-  }
-}
-
 // process all steps need to start the application
 async function startAsync () {
   try {
@@ -460,17 +424,10 @@ async function startAsync () {
     apiServer.startAggInterval()
     apiServer.setPublicKeySet(pubKeys)
     await calendar.initNodeTopBlockAsync()
-
-    // Perform Heartbeat check on /config to make sure node is operational and is capable of passing audits
-    if (nodeUri) {
-      await nodeHeartbeat(nodeUri)
-    }
-
     console.log('INFO : Calendar : Starting Sync...')
     await syncNodeCalendarAsync(coreConfig, pubKeys)
     startIntervals(coreConfig)
     console.log('INFO : Calendar : Sync completed!')
-
     scheduleRestifyRestart()
   } catch (err) {
     console.error(`ERROR : App : Startup : ${err}`)
